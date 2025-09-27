@@ -23,6 +23,6 @@ jobs:
       - name: Run Puppeteer script
         run: node index.js
         env:
-          UNI_USERNAME: ${{ secrets.GYM_USERNAME }}
-          UNI_PASSWORD: ${{ secrets.GYM_PASSWORD }}
+          GYM_USERNAME: ${{ secrets.GYM_USERNAME }}
+          GYM_PASSWORD: ${{ secrets.GYM_PASSWORD }}
           TOTP_SECRET: ${{ secrets.TOTP_SECRET }}
