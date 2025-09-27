@@ -24,6 +24,7 @@ jobs:
       - name: Run Puppeteer script
         uses: tj-actions/puppeteer@v5
         with:
+          install: true
           files: |
             package.json
             package-lock.json
