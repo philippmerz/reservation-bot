@@ -26,9 +26,6 @@ jobs:
         with:
           files: |
             index.js
-            package.json
-            package-lock.json
-          args: node index.js
         env:
           UNI_USERNAME: ${{ secrets.GYM_USERNAME }}
           UNI_PASSWORD: ${{ secrets.GYM_PASSWORD }}
