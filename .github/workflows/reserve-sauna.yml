@@ -26,6 +26,6 @@ jobs:
         with:
           args: node index.js
         env:
-          UNI_USERNAME: ${{ secrets.UNI_USERNAME }}
-          UNI_PASSWORD: ${{ secrets.UNI_PASSWORD }}
+          UNI_USERNAME: ${{ secrets.GYM_USERNAME }}
+          UNI_PASSWORD: ${{ secrets.GYM_PASSWORD }}
           TOTP_SECRET: ${{ secrets.TOTP_SECRET }}
