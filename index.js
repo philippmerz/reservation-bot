@@ -6,7 +6,7 @@ const TIMESLOT = '10:00';
 const DEV = false;
 
 (async () => {
-    const browser = await puppeteer.launch({headless: !DEV, devtools: DEV});
+    const browser = await puppeteer.launch({args: ['--no-sandbox'], headless: !DEV, devtools: DEV});
     const page = await browser.newPage();
 
     try {
