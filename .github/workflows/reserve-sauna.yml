@@ -1,0 +1,31 @@
+name: Sauna Reservation Bot
+
+on:
+  schedule:
+    - cron: '30 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  reserve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Puppeteer script
+        uses: tj-actions/puppeteer@v5
+        with:
+          args: node index.js
+        env:
+          UNI_USERNAME: ${{ secrets.UNI_USERNAME }}
+          UNI_PASSWORD: ${{ secrets.UNI_PASSWORD }}
+          TOTP_SECRET: ${{ secrets.TOTP_SECRET }}
