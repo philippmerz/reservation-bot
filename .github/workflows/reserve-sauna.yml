@@ -25,6 +25,8 @@ jobs:
         uses: tj-actions/puppeteer@v5
         with:
           files: |
+            package.json
+            package-lock.json
             index.js
         env:
           UNI_USERNAME: ${{ secrets.GYM_USERNAME }}
