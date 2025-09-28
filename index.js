@@ -34,6 +34,7 @@ const DEV = false;
         ).catch(() => console.log('No consent step'));
 
         // Reserve
+        await page.waitForSelector('#tag-filterinput', {visible: true});
         await page.type('#tag-filterinput', CATEGORY);
 
         await page.evaluate((category) => {
@@ -70,6 +71,7 @@ const DEV = false;
                 }
             }
         }, TIMESLOT);
+        await page.waitForNetworkIdle({timeout: 15000})
 
         await page.waitForSelector('button[data-test-id="details-book-button"]', {visible: true, timeout: 5000});
         await page.click('button[data-test-id="details-book-button"]');
