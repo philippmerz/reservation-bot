@@ -1,8 +1,8 @@
 const puppeteer = require('puppeteer');
 const {authenticator} = require('otplib');
 
-const CATEGORY = 'Fitness';
-const TIMESLOT = '10:00';
+const CATEGORY = 'Sauna';
+const TIMESLOT = '20:15';
 const DEV = false;
 
 (async () => {
@@ -39,9 +39,9 @@ const DEV = false;
 
         await page.evaluate((category) => {
             const labels = document.querySelectorAll('label');
-            const saunaLabel = Array.from(labels).find(el => el.textContent.trim() === category);
-            if (saunaLabel)
-                saunaLabel.click();
+            const targetLabel = Array.from(labels).find(el => el.textContent.trim() === category);
+            if (targetLabel)
+                targetLabel.click();
         }, CATEGORY);
 
         await new Promise(resolve => setTimeout(resolve, 5000))
