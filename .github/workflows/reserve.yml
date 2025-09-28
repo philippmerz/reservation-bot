@@ -2,9 +2,7 @@ name: Sauna Reservation Bot
 
 on:
   schedule:
-    #    - cron: '30 6 * * 1'
-    - cron: '34 7 * * *'
-
+    - cron: '30 6 * * 1'
   workflow_dispatch:
 
 jobs:
