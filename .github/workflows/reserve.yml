@@ -1,4 +1,4 @@
-name: Sauna Reservation Bot
+name: Reserve session
 
 on:
   schedule:
