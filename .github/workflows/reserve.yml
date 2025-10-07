@@ -2,7 +2,7 @@ name: Reserve session
 
 on:
   schedule:
-    - cron: '45 5 * * 2'
+    - cron: '59 5 * * 3'
   workflow_dispatch:
 
 jobs:
