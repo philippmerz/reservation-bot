@@ -2,7 +2,7 @@ const puppeteer = require('puppeteer');
 const {authenticator} = require('otplib');
 
 const CATEGORY = 'Sauna';
-const TIMESLOT = '20:15';
+const TIMESLOT = '18:15';
 const DEV = false;
 
 (async () => {
