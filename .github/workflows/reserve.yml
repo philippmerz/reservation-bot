@@ -26,3 +26,4 @@ jobs:
           GYM_USERNAME: ${{ secrets.GYM_USERNAME }}
           GYM_PASSWORD: ${{ secrets.GYM_PASSWORD }}
           TOTP_SECRET: ${{ secrets.TOTP_SECRET }}
+          TZ: 'Europe/Berlin'
