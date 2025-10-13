@@ -33,7 +33,7 @@ async function accessSecret(secretName) {
 
 // Export your scheduled function
 exports.yourWeeklyBot = onSchedule({
-    schedule: "0 6 * * 1",
+    schedule: "0 8 * * 2",
     timeZone: "UTC",
     memory: "1GiB",
     timeoutSeconds: 600
