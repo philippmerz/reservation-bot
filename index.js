@@ -33,8 +33,8 @@ async function accessSecret(secretName) {
 
 // Export your scheduled function
 exports.yourWeeklyBot = onSchedule({
-    schedule: "0 8 * * 2",
-    timeZone: "UTC",
+    schedule: "0 8 * * 1",
+    timeZone: "Europe/Amsterdam",
     memory: "1GiB",
     timeoutSeconds: 600
 }, async (event) => {
@@ -43,7 +43,7 @@ exports.yourWeeklyBot = onSchedule({
     const GYM_PASSWORD = await accessSecret("GYM_PASSWORD");
 
     const CATEGORY = 'Sauna';
-    const TIMESLOT = '18:15';
+    const TIMESLOT = '20:15';
     const DEV = false;
 
     // Launch headless Chrome
@@ -55,6 +55,7 @@ exports.yourWeeklyBot = onSchedule({
         ignoreHTTPSErrors: true
     });
     const page = await browser.newPage();
+    await page.emulateTimezone('Europe/Amsterdam');
 
     try {
 
