@@ -31,9 +31,8 @@ async function accessSecret(secretName) {
     return version.payload.data.toString("utf8");
 }
 
-// Export your scheduled function
 exports.yourWeeklyBot = onSchedule({
-    schedule: "0 8 * * 1",
+    schedule: "59 7 * * 6",
     timeZone: "Europe/Amsterdam",
     memory: "1GiB",
     timeoutSeconds: 600
@@ -131,6 +130,11 @@ exports.yourWeeklyBot = onSchedule({
         }, dateStr)
         console.log('Date set to:', dateStr);
 
+        // wait until reservations open to proceed with actually booking
+        const target = new Date();
+        target.setHours(8, 0, 0, 0);
+        await waitUntil(target);
+
         const slotSelector = 'div[data-test-id="bookable-slot-list-item"] p[data-test-id="bookable-slot-start-time"]';
         await page.waitForSelector(slotSelector, {timeout: 10000});
         await page.evaluate((timeslot) => {
@@ -163,3 +167,16 @@ exports.yourWeeklyBot = onSchedule({
         await browser.close();
     }
 })
+
+async function waitUntil(targetTimestamp) {
+    const now = Date.now();
+    const delay = targetTimestamp - now;
+
+    if (delay <= 0) {
+        console.log('Target time has already passed. Proceeding immediately.');
+        return; // No wait needed
+    }
+
+    console.log(`Waiting ${delay}ms until target time...`);
+    await new Promise(resolve => setTimeout(resolve, delay));
+}
