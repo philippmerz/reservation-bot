@@ -1,10 +1,11 @@
-const {onSchedule} = require("firebase-functions/v2/scheduler");
-const {setGlobalOptions} = require("firebase-functions");
+const { onSchedule } = require("firebase-functions/v2/scheduler");
+const { setGlobalOptions } = require("firebase-functions");
 const chromium = require("@sparticuz/chromium");
 const puppeteer = require("puppeteer-core");
-const {authenticator} = require("otplib"); // Your OTP library
-const {SecretManagerServiceClient} = require("@google-cloud/secret-manager");
-const {Storage} = require('@google-cloud/storage');
+const { authenticator } = require("otplib"); // Your OTP library
+const { SecretManagerServiceClient } = require("@google-cloud/secret-manager");
+const { Storage } = require('@google-cloud/storage');
+process.env.TZ = 'Europe/Amsterdam';
 
 const storage = new Storage();
 const BUCKET_NAME = 'reservation-bot-8e993.firebasestorage.app';
@@ -14,12 +15,12 @@ async function uploadArtifact(filePath, destFileName, mimeType) {
 
     await storage.bucket(BUCKET_NAME).upload(filePath, {
         destination: `debug_logs/${destFileName}`, // Uploads to a 'debug_logs' folder
-        metadata: {contentType: mimeType},
+        metadata: { contentType: mimeType },
     });
     console.log(`[STORAGE] Successfully uploaded: gs://${BUCKET_NAME}/debug_logs/${destFileName}`);
 }
 
-setGlobalOptions({maxInstances: 1});
+setGlobalOptions({ maxInstances: 1 });
 
 // Initialize Secret Manager client
 const client = new SecretManagerServiceClient();
@@ -37,12 +38,13 @@ exports.yourWeeklyBot = onSchedule({
     memory: "1GiB",
     timeoutSeconds: 600
 }, async (event) => {
+
     const TOTP_SECRET = await accessSecret("TOTP_SECRET");
     const GYM_USERNAME = await accessSecret("GYM_USERNAME");
     const GYM_PASSWORD = await accessSecret("GYM_PASSWORD");
 
     const CATEGORY = 'Sauna';
-    const TIMESLOT = '20:15';
+    const TIMESLOT = '13:30';
     const DEV = false;
 
     // Launch headless Chrome
@@ -59,19 +61,19 @@ exports.yourWeeklyBot = onSchedule({
     try {
 
         // Login
-        await page.goto('https://tilburguniversity.sports.delcom.nl/pages/login', {waitUntil: 'networkidle2'});
+        await page.goto('https://tilburguniversity.sports.delcom.nl/pages/login', { waitUntil: 'networkidle2' });
         await page.click('[data-test-id="oidc-login-button"]');
-        await page.waitForNavigation({waitUntil: 'networkidle2'});
+        await page.waitForNavigation({ waitUntil: 'networkidle2' });
         await page.click('[data-title="Tilburg University"]');
-        await page.waitForNavigation({waitUntil: 'networkidle2'});
+        await page.waitForNavigation({ waitUntil: 'networkidle2' });
         await page.type('input[name="loginfmt"]', GYM_USERNAME);
         await page.click('input[type="submit"]');
 
-        await page.waitForSelector('input[name="password"]', {visible: true});
+        await page.waitForSelector('input[name="password"]', { visible: true });
         await page.type('input[name="password"]', GYM_PASSWORD);
         await page.click('input[type="submit"]');
 
-        await page.waitForSelector('input[name="otc"]', {visible: true});
+        await page.waitForSelector('input[name="otc"]', { visible: true });
         console.log('before', Date.now());
         await page.type('input[name="otc"]', authenticator.generate(TOTP_SECRET));
         await page.click('input[type="submit"]');
@@ -92,7 +94,7 @@ exports.yourWeeklyBot = onSchedule({
                 console.error(`[NETWORK:HTTP_ERROR] Status ${status} | URL: ${url}`);
             }
         });
-        await page.waitForNavigation({waitUntil: 'networkidle2'});
+        await page.waitForNavigation({ waitUntil: 'networkidle2' });
 
         // log current url
         const currentUrl = page.url();
@@ -100,12 +102,12 @@ exports.yourWeeklyBot = onSchedule({
 
 
         await page.click('button[type="submit"]').then(async () => {
-                await page.waitForNavigation({waitUntil: 'networkidle2'})
-            }
+            await page.waitForNavigation({ waitUntil: 'networkidle2' })
+        }
         ).catch(() => console.log('No consent step'));
 
         // Reserve
-        await page.waitForSelector('#tag-filterinput', {visible: true});
+        await page.waitForSelector('#tag-filterinput', { visible: true });
         await page.type('#tag-filterinput', CATEGORY);
 
         await page.evaluate((category) => {
@@ -125,18 +127,19 @@ exports.yourWeeklyBot = onSchedule({
             const input = document.querySelector('input[type="date"]')
             input.value = dateStr;
             ['input', 'change'].forEach(event => {
-                input.dispatchEvent(new Event(event, {bubbles: true}));
+                input.dispatchEvent(new Event(event, { bubbles: true }));
             });
         }, dateStr)
         console.log('Date set to:', dateStr);
 
         // wait until reservations open to proceed with actually booking
         const target = new Date();
-        target.setHours(8, 0, 0, 0);
+        target.setHours(17, 41, 0, 0);
+        console.log('target:', target.toString());
         await waitUntil(target);
 
         const slotSelector = 'div[data-test-id="bookable-slot-list-item"] p[data-test-id="bookable-slot-start-time"]';
-        await page.waitForSelector(slotSelector, {timeout: 10000});
+        await page.waitForSelector(slotSelector, { timeout: 10000 });
         await page.evaluate((timeslot) => {
             const slots = document.querySelectorAll('div[data-test-id="bookable-slot-list-item"]');
             for (const slot of slots) {
@@ -147,11 +150,11 @@ exports.yourWeeklyBot = onSchedule({
                 }
             }
         }, TIMESLOT);
-        await page.waitForNetworkIdle({timeout: 15000})
+        await page.waitForNetworkIdle({ timeout: 15000 })
 
-        await page.waitForSelector('button[data-test-id="details-book-button"]', {visible: true, timeout: 5000});
+        await page.waitForSelector('button[data-test-id="details-book-button"]', { visible: true, timeout: 5000 });
         await page.click('button[data-test-id="details-book-button"]');
-        await page.waitForNetworkIdle({timeout: 15000})
+        await page.waitForNetworkIdle({ timeout: 15000 })
 
     } catch (error) {
         console.error("Navigation or Timeout Error:", error.message);
@@ -159,7 +162,7 @@ exports.yourWeeklyBot = onSchedule({
         const timestamp = Date.now();
 
         const screenshotPath = `/tmp/failure-${timestamp}.png`;
-        await page.screenshot({path: screenshotPath, fullPage: true});
+        await page.screenshot({ path: screenshotPath, fullPage: true });
         await uploadArtifact(screenshotPath, `screenshot-${timestamp}.png`, 'image/png');
 
         console.error('Error:', error);
