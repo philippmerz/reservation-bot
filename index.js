@@ -18,8 +18,7 @@ const BUCKET_NAME = 'reservation-bot-8e993.firebasestorage.app';
 // dayOfWeek: 0 = Sunday, 1 = Monday, ..., 6 = Saturday
 // ============================================================================
 const RESERVATIONS = [
-    { category: 'Sauna', timeslot: '20:15', dayOfWeek: 1 },  // mon 
-
+    { category: 'CATEGORY', timeslot: '20:15', dayOfWeek: 1 },  // mon 
 ];
 
 const RESERVATION_OPENS_AT_HOUR = 8;
@@ -185,13 +184,13 @@ async function makeReservation(page, reservation) {
     await applyFilters(page, category, dateStr);
 
     // Select the timeslot
-    const slotSelector = 'div[data-test-id="bookable-slot-list-item"]';
+    const slotSelector = '[data-test-id="bookable-slot-list"]';
     await page.waitForSelector(slotSelector, { timeout: 10000 });
     
     await page.evaluate((time) => {
-        const slots = document.querySelectorAll('div[data-test-id="bookable-slot-list-item"]');
+        const slots = document.querySelectorAll('[data-test-id="bookable-slot-list"]');
         for (const slot of slots) {
-            const timeElement = slot.querySelector('p[data-test-id="bookable-slot-start-time"] strong');
+            const timeElement = slot.querySelector('[data-test-id="activities-list-item-start-time"]');
             if (timeElement?.textContent?.trim() === time) {
                 timeElement.click();
                 break;
@@ -201,19 +200,20 @@ async function makeReservation(page, reservation) {
     await page.waitForNetworkIdle({ timeout: 15000 });
 
     // Click the book button
-    await page.waitForSelector('button[data-test-id="details-book-button"]', { visible: true, timeout: 5000 });
-    await page.click('button[data-test-id="details-book-button"]');
+    await page.waitForSelector('[data-test-id="details-book-button"]', { visible: true, timeout: 5000 });
+    await page.click('[data-test-id="details-book-button"]');
     await page.waitForNetworkIdle({ timeout: 15000 });
 
     console.log(`Successfully booked: ${category} at ${timeslot} on ${dateStr}`);
 }
 
 async function applyFilters(page, category, dateStr) {
-    await page.waitForSelector('#tag-filterinput', { visible: true });
-    await clearAndType(page, '#tag-filterinput', category);
+    page.click('[data-test-id="open-tag-selection-filter"]');
+    await page.waitForSelector('[data-test-id="tag-filter-input"]', { visible: true });
+    await clearAndType(page, '[data-test-id="tag-filter-input"]', category);
 
     await page.evaluate((cat) => {
-        const labels = document.querySelectorAll('label');
+        const labels = document.querySelectorAll('[data-test-id="selectable-tag-description"]');
         const targetLabel = Array.from(labels).find(el => el.textContent.trim() === cat);
         if (targetLabel) targetLabel.click();
     }, category);
