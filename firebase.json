@@ -6,6 +6,10 @@
       "ignore": [
         "node_modules",
         ".git",
+        ".idea",
+        ".DS_Store",
+        "*.iml",
+        "secrets.json",
         "firebase-debug.log",
         "firebase-debug.*.log",
         "*.local"
