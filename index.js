@@ -1,630 +1,446 @@
-const { onSchedule } = require("firebase-functions/v2/scheduler");
-const { setGlobalOptions } = require("firebase-functions");
-const chromium = require("@sparticuz/chromium");
-const puppeteer = require("puppeteer-core");
-const { authenticator } = require("otplib");
-const { SecretManagerServiceClient } = require("@google-cloud/secret-manager");
-const { Storage } = require('@google-cloud/storage');
+'use strict';
+
+const { SecretManagerServiceClient } = require('@google-cloud/secret-manager');
+const { setGlobalOptions } = require('firebase-functions');
+const { onSchedule } = require('firebase-functions/v2/scheduler');
+
+const {
+    ACCEPTED_PARTICIPATION_STATUS,
+    HttpRequestError,
+    VISIBLE_BOOKING_STATUS,
+    buildParticipationPayload,
+    createDelcomClient,
+    decodeJwtTemporalClaims,
+    findExactBookingCandidates,
+    refreshOidcToken,
+    resolveCategoryTagId,
+    selectUserRole
+} = require('./delcom-api');
 
 process.env.TZ = 'Europe/Amsterdam';
 
-const storage = new Storage();
-const BUCKET_NAME = 'reservation-bot-8e993.firebasestorage.app';
-const SPORTS_PORTAL_ORIGIN = 'https://tilburguniversity.sports.delcom.nl';
-const LOGIN_URL = `${SPORTS_PORTAL_ORIGIN}/pages/login`;
-const ACTIVITIES_URL = `${SPORTS_PORTAL_ORIGIN}/bookings/activities`;
-const AUTH_TIMEOUT_MS = 45_000;
-const PORTAL_READY_TIMEOUT_MS = 60_000;
-
-// ============================================================================
-// RESERVATION CONFIGURATION
-// ============================================================================
-// Each reservation will be made at 8:00 AM exactly 7 days before the slot.
-// dayOfWeek: 0 = Sunday, 1 = Monday, ..., 6 = Saturday
-// ============================================================================
-const RESERVATIONS = [
-    { category: 'CATEGORY', timeslot: '20:15', dayOfWeek: 1 },  // mon 
-];
-
+const PROJECT_NUMBER = '576703361007';
+const REFRESH_TOKEN_SECRET = 'GYM_REFRESH_TOKEN';
 const RESERVATION_OPENS_AT_HOUR = 8;
 const RESERVATION_OPENS_AT_MINUTE = 0;
 const DAYS_IN_ADVANCE = 7;
+const SCHEDULE_DISCOVERY_TIMEOUT_MS = 30_000;
 
-// Run the whole session at a common mobile viewport (iPhone 14/15 logical size)
-const MOBILE_VIEWPORT = { width: 390, height: 844, deviceScaleFactor: 2, isMobile: true, hasTouch: true };
+// dayOfWeek: 0 = Sunday, 1 = Monday, ..., 6 = Saturday.
+const RESERVATIONS = [
+    { category: 'Sauna', timeslot: '21:30', dayOfWeek: 1 },
+    { category: 'Sauna', timeslot: '20:15', dayOfWeek: 3 },
+    { category: 'Sauna', timeslot: '20:15', dayOfWeek: 5 }
+];
 
-async function uploadArtifact(filePath, destFileName, mimeType) {
-    console.log(`[STORAGE] Starting upload of ${destFileName} from ${filePath}`);
-
-    await storage.bucket(BUCKET_NAME).upload(filePath, {
-        destination: `debug_logs/${destFileName}`, // Uploads to a 'debug_logs' folder
-        metadata: { contentType: mimeType },
-    });
-    console.log(`[STORAGE] Successfully uploaded: gs://${BUCKET_NAME}/debug_logs/${destFileName}`);
-}
+const secretManager = new SecretManagerServiceClient();
 
 setGlobalOptions({ maxInstances: 1, concurrency: 1 });
 
-// Initialize Secret Manager client
-const client = new SecretManagerServiceClient();
-
-async function accessSecret(secretName) {
-    const [version] = await client.accessSecretVersion({
-        name: `projects/576703361007/secrets/${secretName}/versions/latest`
-    });
-    return version.payload.data.toString("utf8");
-}
-
 exports.yourWeeklyBot = onSchedule({
-    schedule: "59 7 * * *",  // Run daily at 7:59 AM to be ready for 8:00 AM reservations
-    timeZone: "Europe/Amsterdam",
-    memory: "1GiB",
-    timeoutSeconds: 600
-}, async (event) => {
-    const todaysReservations = getReservationsForToday();
-    
-    if (todaysReservations.length === 0) {
-        console.log('No reservations to make today.');
+    schedule: '59 7 * * *',
+    timeZone: 'Europe/Amsterdam',
+    memory: '256MiB',
+    timeoutSeconds: 180,
+    // The upstream refresh token is single-use. An ambiguous refresh response
+    // must never cause Cloud Scheduler to submit the stored token a second time.
+    retryCount: 0
+}, async () => {
+    const now = new Date();
+    const dateStr = getReservationDateString(now);
+    const reservations = getReservationsForToday(now);
+
+    if (reservations.length === 0) {
+        console.log(`[RUN] No configured reservations for ${dateStr}.`);
         return;
     }
 
-    console.log(`Found ${todaysReservations.length} reservation(s) to make today:`, 
-        todaysReservations.map(r => `${r.category} at ${r.timeslot}`));
+    console.log(`[RUN] Preparing ${reservations.length} reservation(s) for ${dateStr}.`);
 
-    let browser;
-    let page;
+    const session = await getRefreshedSession();
+    const unaffiliatedClient = createLoggedDelcomClient({ accessToken: session.accessToken });
+    const memberResponse = await retryRead(() => unaffiliatedClient.getMember(), 'member lookup');
+    const member = memberResponse?.data ?? memberResponse;
 
-    try {
-        const TOTP_SECRET = await accessSecret("TOTP_SECRET");
-        const GYM_USERNAME = await accessSecret("GYM_USERNAME");
-        const GYM_PASSWORD = await accessSecret("GYM_PASSWORD");
+    if (!Number.isFinite(Number(member?.id))) {
+        throw new Error('The Delcom auth endpoint did not return a usable member ID.');
+    }
 
-        browser = await launchBrowser();
-        page = await browser.newPage();
-        await page.emulateTimezone('Europe/Amsterdam');
-        setupNetworkLogging(page);
+    const userRole = selectUserRole(member);
+    const client = createLoggedDelcomClient({
+        accessToken: session.accessToken,
+        userRoleId: userRole.id,
+        language: member.language || 'nl'
+    });
 
-        await loginToSportsPortal(page, GYM_USERNAME, GYM_PASSWORD, TOTP_SECRET);
-        
-        // Wait once for reservations to open, then book all slots
-        await waitUntilReservationsOpen();
-        
-        for (const reservation of todaysReservations) {
-            await makeReservation(page, reservation);
-        }
+    // Resolve stable names to the portal's current IDs before the booking window opens.
+    const tagIds = new Map();
+    for (const category of new Set(reservations.map(reservation => reservation.category))) {
+        tagIds.set(category, await retryRead(
+            () => resolveCategoryTagId(client, category),
+            `tag lookup for ${category}`
+        ));
+    }
 
-        console.log('All reservations completed successfully.');
-    } catch (error) {
-        if (page) {
-            await captureFailureScreenshot(page, error);
-        } else {
-            console.error('Bot failed before a browser page was created:', sanitizeLogText(error.message));
-        }
-        throw error;
-    } finally {
-        if (browser) {
-            await browser.close().catch(closeError => {
-                console.error('Could not close browser cleanly:', sanitizeLogText(closeError.message));
+    await waitUntilReservationsOpen();
+
+    const failures = [];
+    for (const reservation of reservations) {
+        try {
+            await makeApiReservation({
+                client,
+                memberId: Number(member.id),
+                reservation,
+                dateStr,
+                tagId: tagIds.get(reservation.category)
             });
+        } catch (error) {
+            failures.push(error);
+            console.error(`[BOOK] ${reservation.category} ${reservation.timeslot} failed: ${safeErrorMessage(error)}`);
         }
     }
+
+    if (failures.length > 0) {
+        throw new AggregateError(failures, `${failures.length} reservation(s) failed.`);
+    }
+
+    console.log('[RUN] All configured reservations are confirmed.');
 });
 
-// ============================================================================
-// HELPER FUNCTIONS
-// ============================================================================
-
-function getReservationsForToday() {
-    const today = new Date();
-    const targetDayOfWeek = getTargetDayOfWeek(today);
-    
-    return RESERVATIONS.filter(r => r.dayOfWeek === targetDayOfWeek);
-}
-
-function getTargetDayOfWeek(today) {
-    // Reservations open 7 days in advance at 8:00 AM
-    // So today we're booking for (today + 7 days)
-    const targetDate = new Date(today);
-    targetDate.setDate(targetDate.getDate() + DAYS_IN_ADVANCE);
-    return targetDate.getDay();
-}
-
-function getReservationDateString() {
-    const now = new Date();
-    const targetDate = new Date(now);
-    targetDate.setDate(targetDate.getDate() + DAYS_IN_ADVANCE);
-    return targetDate.toISOString().split('T')[0]; // YYYY-MM-DD
-}
-
-async function launchBrowser() {
-    // @sparticuz/chromium ships --single-process, which makes Page.captureScreenshot
-    // hang (browser and renderer share one thread). We have 1GiB, so run multi-process.
-    const args = [
-        ...chromium.args.filter(arg => arg !== '--single-process'),
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage"
-    ];
-
-    return puppeteer.launch({
-        args,
-        defaultViewport: MOBILE_VIEWPORT,
-        executablePath: await chromium.executablePath(),
-        headless: true,
-        ignoreHTTPSErrors: true,
-        protocolTimeout: 60_000  // default is 180s; fail fast instead of burning the function timeout
-    });
-}
-
-function setupNetworkLogging(page) {
-    page.on('response', response => {
-        const status = response.status();
-        const url = sanitizeUrl(response.url());
-        const headers = response.headers();
-
-        if (status >= 300 && status < 400) {
-            console.warn(`[NETWORK:REDIRECT] Status ${status} | From: ${url} | To: ${sanitizeUrl(headers.location, response.url())}`);
-        } else if (url.includes('login.microsoftonline.com') && status !== 200) {
-            console.error(`[NETWORK:MSFT_ERROR] Status ${status} | URL: ${url}`);
-        } else if (status >= 400) {
-            console.error(`[NETWORK:HTTP_ERROR] Status ${status} | URL: ${url}`);
+function createLoggedDelcomClient(options) {
+    return createDelcomClient({
+        ...options,
+        onResponse: ({ method, path, status }) => {
+            console.log(`[API] ${method} ${path} -> ${status}`);
         }
     });
 }
 
-async function loginToSportsPortal(page, username, password, totpSecret) {
-    console.log('Logging in to sports portal...');
+async function getRefreshedSession() {
+    const current = await accessSecretWithVersion(REFRESH_TOKEN_SECRET);
 
-    const normalizedUsername = String(username).trim();
-    if (!normalizedUsername.includes('@')) {
-        throw new Error('GYM_USERNAME must be the full university email/UPN required by Microsoft sign-in.');
-    }
-
-    await page.goto(LOGIN_URL, { waitUntil: 'networkidle2', timeout: AUTH_TIMEOUT_MS });
-    await dismissCookieDialog(page);
-
-    await clickVisibleAndWaitForNavigation(page, '[data-test-id="oidc-login-button"]');
-    await submitVisibleInstitutionAndWaitForNavigation(page);
-
-    await clearAndType(page, 'input[name="loginfmt"]', normalizedUsername);
-    await clickVisibleAndWaitForNavigation(page, '#idSIButton9');
-
-    // Tilburg's ADFS form uses name="password". The fallback covers Microsoft's
-    // current name="passwd" field if the identity flow changes again.
-    await clearAndType(page, 'input[name="password"], input[name="passwd"], input[type="password"]', password);
-    await clickVisibleAndWaitForNavigation(page, 'input[type="submit"]');
-
-    await clearAndType(page, 'input[name="otc"]', authenticator.generate(String(totpSecret).trim()));
-    await clickVisibleAndWaitForNavigation(page, '#idSubmit_SAOTCC_Continue');
-
-    await finishOptionalAuthentication(page);
-    await waitForPortalReady(page);
-
-    console.log('Login successful. Current URL:', sanitizeUrl(page.url()));
-}
-
-async function dismissCookieDialog(page) {
-    let declineButton;
+    let refreshed;
     try {
-        declineButton = await waitForVisibleElement(page, '[data-test-id="cookie-decline-all"]', 3_000);
+        // OpenConext refresh tokens are single-use. This request must never be retried.
+        refreshed = await refreshOidcToken(current.value);
     } catch (error) {
-        if (error.code !== 'VISIBLE_SELECTOR_TIMEOUT') throw error;
-        console.log('No cookie dialog shown.');
-        return;
+        throw authRecoveryError('Token refresh failed. The stored token may need replacement.', error);
     }
 
-    await declineButton.click();
-    await page.waitForFunction(selector => {
-        const elements = Array.from(document.querySelectorAll(selector));
-        return elements.every(element => {
-            const style = window.getComputedStyle(element);
-            const rect = element.getBoundingClientRect();
-            return style.display === 'none' || style.visibility === 'hidden' || rect.width === 0 || rect.height === 0;
-        });
-    }, { timeout: 10_000 }, '[data-test-id="cookie-decline-all"]');
-
-    // Dismissing the dialog can rerender the login controls.
-    await waitForVisibleElement(page, '[data-test-id="oidc-login-button"]');
-    console.log('Cookie dialog dismissed.');
-}
-
-async function submitVisibleInstitutionAndWaitForNavigation(page) {
-    const institution = await waitForVisibleElement(page, '[data-title="Tilburg University"]');
-    const navigation = page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: AUTH_TIMEOUT_MS });
-
-    await Promise.all([
-        navigation,
-        institution.evaluate(element => {
-            const form = element.querySelector('form');
-            if (!form) throw new Error('Tilburg University login form was not found.');
-            form.requestSubmit();
-        })
-    ]);
-}
-
-async function clickVisibleAndWaitForNavigation(page, selector) {
-    const element = await waitForVisibleElement(page, selector, AUTH_TIMEOUT_MS);
-    const navigation = page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: AUTH_TIMEOUT_MS });
-    await Promise.all([navigation, element.click()]);
-}
-
-async function finishOptionalAuthentication(page) {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-        const currentUrl = new URL(page.url());
-        if (currentUrl.origin === SPORTS_PORTAL_ORIGIN) return;
-
-        if (currentUrl.hostname === 'login.microsoftonline.com') {
-            const result = await waitForOptionalAuthButtonOrPortal(page, '#idSIButton9');
-            if (result.state === 'portal') return;
-            if (result.state === 'changed') continue;
-            console.log('Completing optional Microsoft confirmation.');
-            await clickAuthButtonAndWaitForNavigation(page, result.element);
-            continue;
-        }
-
-        if (currentUrl.hostname.endsWith('surfconext.nl')) {
-            const result = await waitForOptionalAuthButtonOrPortal(
-                page,
-                'button[type="submit"], input[type="submit"]'
-            );
-            if (result.state === 'portal') return;
-            if (result.state === 'changed') continue;
-            console.log('Completing optional SURFconext consent.');
-            await clickAuthButtonAndWaitForNavigation(page, result.element);
-            continue;
-        }
-
-        throw new Error(`Unexpected authentication page: ${sanitizeUrl(page.url())}`);
-    }
-
-    throw new Error(`Authentication did not return to the sports portal: ${sanitizeUrl(page.url())}`);
-}
-
-async function waitForOptionalAuthButtonOrPortal(page, selector, timeout = 15_000) {
-    const deadline = Date.now() + timeout;
-    const startingOrigin = new URL(page.url()).origin;
-
-    while (Date.now() < deadline) {
-        const currentOrigin = new URL(page.url()).origin;
-        if (currentOrigin === SPORTS_PORTAL_ORIGIN) return { state: 'portal' };
-        if (currentOrigin !== startingOrigin) return { state: 'changed' };
-
+    if (refreshed.refreshTokenRotated) {
         try {
-            const element = await findVisibleElement(page, selector);
-            if (element) return { state: 'button', element };
+            await storeRotatedRefreshToken(refreshed.refreshToken);
         } catch (error) {
-            if (page.isClosed()) throw error;
+            throw authRecoveryError('A new token was issued but could not be safely persisted.', error);
         }
-        await sleep(100);
+    } else {
+        // Kept as a defensive fallback for standards-compliant providers that omit it.
+        // OpenConext currently always rotates and returns a new refresh token.
+        console.warn('[AUTH] The token endpoint did not return a rotated refresh token; retaining the current version.');
     }
 
-    throw new Error(`Authentication stalled at ${sanitizeUrl(page.url())}`);
-}
+    const accessClaims = decodeJwtTemporalClaims(refreshed.accessToken);
+    const refreshClaims = decodeJwtTemporalClaims(refreshed.refreshToken);
+    const refreshDaysRemaining = refreshClaims.expiresAt === null
+        ? null
+        : Math.max(0, (refreshClaims.expiresAt - Math.floor(Date.now() / 1000)) / 86_400);
 
-async function clickAuthButtonAndWaitForNavigation(page, element) {
-    const navigation = page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: AUTH_TIMEOUT_MS });
-    try {
-        await Promise.all([navigation, element.click()]);
-    } catch (error) {
-        if (new URL(page.url()).origin === SPORTS_PORTAL_ORIGIN) return;
-        throw error;
-    }
-}
-
-async function waitForPortalReady(page) {
-    await page.waitForFunction((origin, markerSelector) => {
-        const marker = document.querySelector(markerSelector);
-        if (!marker || location.origin !== origin) return false;
-        const style = window.getComputedStyle(marker);
-        const rect = marker.getBoundingClientRect();
-        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-    }, {
-        timeout: PORTAL_READY_TIMEOUT_MS,
-        polling: 100
-    }, SPORTS_PORTAL_ORIGIN, '[data-test-id="open-tag-selection-filter"]');
-}
-
-async function findVisibleElement(page, selector) {
-    const elements = await page.$$(selector);
-
-    for (const element of elements) {
-        let visible = false;
-        try {
-            visible = await element.evaluate(node => {
-                const style = window.getComputedStyle(node);
-                const rect = node.getBoundingClientRect();
-                return node.getAttribute('aria-hidden') !== 'true' &&
-                    style.display !== 'none' &&
-                    style.visibility !== 'hidden' &&
-                    rect.width > 0 &&
-                    rect.height > 0;
-            });
-        } catch {
-            // The page may have navigated while inspecting the element.
-        }
-
-        if (visible) {
-            for (const otherElement of elements) {
-                if (otherElement !== element) await otherElement.dispose().catch(() => {});
-            }
-            return element;
-        }
-
-        await element.dispose().catch(() => {});
-    }
-
-    return null;
-}
-
-async function waitForVisibleElement(page, selector, timeout = 30_000) {
-    const deadline = Date.now() + timeout;
-
-    while (Date.now() < deadline) {
-        try {
-            const element = await findVisibleElement(page, selector);
-            if (element) return element;
-        } catch (error) {
-            if (page.isClosed()) throw error;
-            // Execution contexts are briefly unavailable during navigation.
-        }
-        await sleep(100);
-    }
-
-    const error = new Error(`Timed out waiting for visible selector: ${selector}`);
-    error.code = 'VISIBLE_SELECTOR_TIMEOUT';
-    throw error;
-}
-
-async function makeReservation(page, reservation) {
-    const { category, timeslot } = reservation;
-    console.log(`\nMaking reservation: ${category} at ${timeslot}`);
-
-    const dateStr = getReservationDateString();
-    await ensureActivitiesPage(page);
-    await applyFilters(page, category, dateStr);
-    const dateHeader = await openReservationDetails(page, category, timeslot, dateStr);
-    await confirmReservation(page);
-
-    console.log(`Successfully booked: ${category} at ${timeslot} on ${dateStr} (${dateHeader})`);
-}
-
-async function ensureActivitiesPage(page) {
-    const modalCloseSelector = '[data-test-id="secondary-button-close-modal"], [data-test-id="button-close-modal"], [data-test-id="details-cancel-button"]';
-    const closeButton = await findVisibleElement(page, modalCloseSelector).catch(() => null);
-    if (closeButton) {
-        await closeButton.click();
-        await page.waitForFunction(selector => !Array.from(document.querySelectorAll(selector)).some(button => {
-            const style = window.getComputedStyle(button);
-            const rect = button.getBoundingClientRect();
-            return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-        }), { timeout: 5_000 }, modalCloseSelector);
-    }
-
-    const filterButton = await findVisibleElement(page, '[data-test-id="open-tag-selection-filter"]').catch(() => null);
-    if (filterButton) {
-        await filterButton.dispose().catch(() => {});
-        return;
-    }
-
-    await page.goto(ACTIVITIES_URL, { waitUntil: 'networkidle2', timeout: AUTH_TIMEOUT_MS });
-    await waitForPortalReady(page);
-}
-
-async function openReservationDetails(page, category, timeslot, dateStr) {
-    const expectedDateHeaders = getExpectedDateHeaders(dateStr);
-
-    try {
-        await page.waitForFunction(expectedHeaders => {
-            const header = document.querySelector('#activitiesList > h2.date-header');
-            const normalizedHeader = header?.textContent
-                ?.toUpperCase()
-                .replace(/[.,]/g, '')
-                .replace(/\s+/g, ' ')
-                .trim();
-            return Boolean(normalizedHeader && expectedHeaders.includes(normalizedHeader));
-        }, { timeout: 15_000, polling: 100 }, expectedDateHeaders);
-    } catch {
-        const renderedHeader = await page.$eval('#activitiesList > h2.date-header', element =>
-            element.textContent.trim().replace(/\s+/g, ' ')).catch(() => 'none');
-        throw new Error(`Activity list did not update to ${dateStr}; first rendered date section is ${renderedHeader}.`);
-    }
-
-    const result = await page.evaluate(({ categoryName, time, expectedHeaders }) => {
-        const list = document.querySelector('#activitiesList');
-        if (!list) return { found: false, dateHeader: null };
-
-        const children = Array.from(list.children);
-        const firstHeaderIndex = children.findIndex(element => element.matches('h2.date-header'));
-        if (firstHeaderIndex < 0) return { found: false, dateHeader: null };
-
-        const nextHeaderIndex = children.findIndex((element, index) =>
-            index > firstHeaderIndex && element.matches('h2.date-header'));
-        const endIndex = nextHeaderIndex < 0 ? children.length : nextHeaderIndex;
-        const dateHeader = children[firstHeaderIndex].textContent.trim().replace(/\s+/g, ' ');
-        const normalizedDateHeader = dateHeader.toUpperCase().replace(/[.,]/g, '').replace(/\s+/g, ' ').trim();
-        if (!expectedHeaders.includes(normalizedDateHeader)) return { found: false, dateHeader };
-
-        for (const card of children.slice(firstHeaderIndex + 1, endIndex)) {
-            const timeElement = card.querySelector?.('[data-test-id="activities-list-item-start-time"]');
-            const categoryElement = card.querySelector?.('[data-test-id="activities-list-item-resource-product-translation"]');
-            if (timeElement?.textContent?.trim() === time && categoryElement?.textContent?.trim() === categoryName) {
-                timeElement.click();
-                return { found: true, dateHeader };
-            }
-        }
-
-        return { found: false, dateHeader };
-    }, { categoryName: category, time: timeslot, expectedHeaders: expectedDateHeaders });
-
-    if (!result.found) {
-        throw new Error(`No ${timeslot} slot found for ${dateStr} in the first rendered date section (${result.dateHeader || 'unknown date'}).`);
-    }
-
-    await waitForVisibleElement(page, '[data-test-id="details-book-button"]', 15_000);
-    return result.dateHeader;
-}
-
-function getExpectedDateHeaders(dateStr) {
-    const [year, month, day] = dateStr.split('-').map(Number);
-    const date = new Date(Date.UTC(year, month - 1, day, 12));
-    if (Number.isNaN(date.getTime())) throw new Error(`Invalid reservation date: ${dateStr}`);
-
-    const options = { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'Europe/Amsterdam' };
-    const englishWeekdays = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
-    const englishMonths = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
-    const candidates = [
-        new Intl.DateTimeFormat('nl-NL', options).format(date),
-        new Intl.DateTimeFormat('en-GB', options).format(date),
-        new Intl.DateTimeFormat('en-US', options).format(date),
-        `${englishWeekdays[date.getUTCDay()]} ${date.getUTCDate()} ${englishMonths[date.getUTCMonth()]}`
-    ];
-
-    return [...new Set(candidates.map(value => value
-        .toUpperCase()
-        .replace(/[.,]/g, '')
-        .replace(/\s+/g, ' ')
-        .trim()))];
-}
-
-async function confirmReservation(page) {
-    const bookButton = await waitForVisibleElement(page, '[data-test-id="details-book-button"]', 5_000);
-    const canBook = await bookButton.evaluate(button =>
-        !button.disabled && button.getAttribute('aria-disabled') !== 'true');
-    if (!canBook) throw new Error('The selected slot is not bookable.');
-
-    const participationResponse = page.waitForResponse(response => {
-        try {
-            const url = new URL(response.url());
-            return response.request().method() === 'POST' && url.pathname.endsWith('/participations');
-        } catch {
-            return false;
-        }
-    }, { timeout: 20_000 });
-
-    const [response] = await Promise.all([participationResponse, bookButton.click()]);
-    if (response.status() < 200 || response.status() >= 300) {
-        throw new Error(`Reservation request failed with HTTP ${response.status()}.`);
-    }
-
-    const outcomeHandle = await page.waitForFunction(() => {
-        const isVisible = element => {
-            if (!element) return false;
-            const style = window.getComputedStyle(element);
-            const rect = element.getBoundingClientRect();
-            return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-        };
-
-        if (isVisible(document.querySelector('[data-test-id="booking-success"]'))) return 'success';
-        if (isVisible(document.querySelector('.modal-footer .modal-alert.alert-danger[role="alert"]'))) return 'error';
-        if (isVisible(document.querySelector('[data-test-id="error-message-on-resource-selection"]'))) return 'error';
-        return false;
-    }, { timeout: 15_000, polling: 100 });
-
-    const outcome = await outcomeHandle.jsonValue();
-    await outcomeHandle.dispose();
-    if (outcome !== 'success') throw new Error('The sports portal rejected the reservation.');
-
-    const closeButton = await waitForVisibleElement(
-        page,
-        '[data-test-id="secondary-button-close-modal"], [data-test-id="button-close-modal"]',
-        5_000
+    console.log(
+        `[AUTH] Session refreshed; access lifetime ${accessClaims.lifetimeSeconds ?? refreshed.expiresIn ?? 'unknown'}s; ` +
+        `refresh validity ${refreshDaysRemaining === null ? 'unknown' : `${refreshDaysRemaining.toFixed(1)}d`}.`
     );
-    await closeButton.click();
-    await page.waitForFunction(() => !document.querySelector('[data-test-id="booking-success"]'), { timeout: 5_000 });
+
+    return refreshed;
 }
 
-async function applyFilters(page, category, dateStr) {
-    const openFilterButton = await waitForVisibleElement(page, '[data-test-id="open-tag-selection-filter"]');
-    await openFilterButton.click();
-    await clearAndType(page, '[data-test-id="tag-filter-input"]', category);
+async function accessSecretWithVersion(secretName) {
+    const [version] = await secretManager.accessSecretVersion({
+        name: `projects/${PROJECT_NUMBER}/secrets/${secretName}/versions/latest`
+    });
+    const value = version.payload?.data?.toString('utf8').trim();
 
-    const tagSelection = await page.evaluate(cat => {
-        const labels = document.querySelectorAll('[data-test-id="selectable-tag-description"]');
-        const targetLabel = Array.from(labels).find(element => element.textContent.trim() === cat);
-        const showButton = document.querySelector('[data-test-id="discovery-area-show-button"]');
-        if (!targetLabel || !showButton) {
-            return { tagFound: Boolean(targetLabel), showButtonFound: Boolean(showButton) };
-        }
+    if (!value || !version.name) {
+        throw new Error(`${secretName} has no readable enabled version.`);
+    }
 
-        targetLabel.click();
-        showButton.click();
-        return { tagFound: true, showButtonFound: true };
-    }, category);
-
-    if (!tagSelection.tagFound) throw new Error(`Reservation category not found: ${category}`);
-    if (!tagSelection.showButtonFound) throw new Error('Filter confirmation button not found.');
-
-    await page.waitForNetworkIdle({ timeout: 15_000 });
-
-    const dateWasSet = await page.evaluate(date => {
-        const input = document.querySelector('input[type="date"]');
-        if (!input) return false;
-        input.value = date;
-        ['input', 'change'].forEach(eventName => {
-            input.dispatchEvent(new Event(eventName, { bubbles: true }));
-        });
-        return input.value === date;
-    }, dateStr);
-
-    if (!dateWasSet) throw new Error(`Could not set reservation date to ${dateStr}.`);
-    await page.waitForNetworkIdle({ timeout: 15_000 });
-    await waitForVisibleElement(page, '#activitiesList > h2.date-header', 15_000);
-    console.log(`Filters applied: ${category}, ${dateStr}`);
+    return { value, versionName: version.name };
 }
 
-async function clearAndType(page, selector, text) {
-    const input = await waitForVisibleElement(page, selector);
-    await input.click({ clickCount: 3 });
-    await input.type(String(text));
+async function storeRotatedRefreshToken(refreshToken) {
+    const parent = `projects/${PROJECT_NUMBER}/secrets/${REFRESH_TOKEN_SECRET}`;
+    const [created] = await secretManager.addSecretVersion({
+        parent,
+        payload: { data: Buffer.from(refreshToken, 'utf8') }
+    });
+
+    if (!created.name) throw new Error('Secret Manager did not return the new version name.');
+
+    const [readBack] = await secretManager.accessSecretVersion({ name: created.name });
+    const persisted = readBack.payload?.data?.toString('utf8').trim();
+    if (persisted !== refreshToken) {
+        throw new Error('The new refresh-token secret version failed read-back verification.');
+    }
+
+    console.log(`[AUTH] Persisted rotated refresh token as secret version ${versionId(created.name)}.`);
+
+    // Clean up any backlog left by earlier transient failures. Only older versions
+    // are touched, so a concurrent recovery that creates a newer version stays safe.
+    await destroyOlderRefreshTokenVersions(parent, created.name);
 }
 
-async function waitUntilReservationsOpen() {
-    const target = new Date();
-    target.setHours(RESERVATION_OPENS_AT_HOUR, RESERVATION_OPENS_AT_MINUTE, 0, 0);
-    
-    const now = Date.now();
-    const delay = target.getTime() - now;
-
-    if (delay <= 0) {
-        console.log('Reservation window already open. Proceeding immediately.');
+async function destroyOlderRefreshTokenVersions(parent, createdVersionName) {
+    const createdId = Number(versionId(createdVersionName));
+    if (!Number.isSafeInteger(createdId)) {
+        console.warn('[AUTH] Could not identify the new version number; skipping old-version cleanup.');
         return;
     }
 
-    console.log(`Waiting ${Math.round(delay / 1000)}s until reservations open at ${target.toLocaleTimeString()}...`);
-    await sleep(delay);
-    console.log('Reservation window is now open!');
-}
-
-async function captureFailureScreenshot(page, error) {
-    console.error('Error during reservation:', sanitizeLogText(error.message));
-    if (error.stack) console.error(sanitizeLogText(error.stack));
-
-    const timestamp = Date.now();
-    const screenshotPath = `/tmp/failure-${timestamp}.png`;
-
-    // Never let a screenshot problem replace the actual failure in the logs
+    let versions;
     try {
-        await page.screenshot({ path: screenshotPath, optimizeForSpeed: true });
-        await uploadArtifact(screenshotPath, `screenshot-${timestamp}.png`, 'image/png');
-    } catch (screenshotError) {
-        console.error('Could not capture failure screenshot:', sanitizeLogText(screenshotError.message));
+        [versions] = await secretManager.listSecretVersions({ parent });
+    } catch (error) {
+        console.warn(`[AUTH] Could not list superseded secret versions: ${safeErrorMessage(error)}`);
+        return;
+    }
+
+    for (const version of versions) {
+        const candidateId = Number(versionId(version.name));
+        const isDestroyed = version.state === 'DESTROYED' || Number(version.state) === 3;
+        if (!Number.isSafeInteger(candidateId) || candidateId >= createdId || isDestroyed) continue;
+
+        try {
+            await secretManager.destroySecretVersion({ name: version.name });
+            console.log(`[AUTH] Destroyed superseded secret version ${candidateId}.`);
+        } catch (error) {
+            // The verified new version is already usable; retry this cleanup next run.
+            console.warn(
+                `[AUTH] Could not destroy superseded secret version ${candidateId}: ${safeErrorMessage(error)}`
+            );
+        }
     }
 }
 
-function sanitizeUrl(rawUrl, baseUrl) {
-    if (!rawUrl) return '(none)';
+function versionId(versionName) {
+    return String(versionName).split('/').at(-1) || 'unknown';
+}
+
+function authRecoveryError(message, cause) {
+    return new Error(
+        `[AUTH_RECOVERY_REQUIRED] ${message} Run \`npm run bootstrap-token\` from an authenticated local machine. ` +
+        `Cause: ${safeErrorMessage(cause)}`,
+        { cause }
+    );
+}
+
+async function makeApiReservation({ client, memberId, reservation, dateStr, tagId }) {
+    const booking = await findBookingUntilDeadline(client, reservation, dateStr, tagId);
+    const bookingId = Number(booking.id);
+
+    const existing = await getRelevantParticipations(client, memberId, bookingId);
+    const accepted = existing.find(participation =>
+        Number(participation.status) === ACCEPTED_PARTICIPATION_STATUS
+    );
+
+    if (accepted) {
+        console.log(
+            `[BOOK] Already confirmed ${reservation.category} ${dateStr} ${reservation.timeslot}; ` +
+            `participation ${accepted.id}.`
+        );
+        return accepted;
+    }
+
+    if (existing.length > 0) {
+        const statuses = [...new Set(existing.map(participation => Number(participation.status)))].join(',');
+        throw new Error(`A non-confirmed participation already exists for booking ${bookingId} (status ${statuses}).`);
+    }
+
+    if (Number(booking.status) !== VISIBLE_BOOKING_STATUS) {
+        throw new Error(`Booking ${bookingId} is not bookable (status ${booking.status}).`);
+    }
+
+    const payload = buildParticipationPayload(memberId, booking);
+    let created;
+
     try {
-        const url = new URL(rawUrl, baseUrl);
-        return `${url.origin}${url.pathname}`;
-    } catch {
-        return '[invalid URL]';
+        created = unwrapEntity(await client.createParticipation(payload));
+    } catch (error) {
+        // POST is deliberately never retried. A response could have been lost after creation.
+        const reconciled = await reconcileAcceptedParticipation(client, memberId, bookingId);
+        if (reconciled) {
+            console.log(
+                `[BOOK] Confirmed ${reservation.category} ${dateStr} ${reservation.timeslot} after POST reconciliation; ` +
+                `participation ${reconciled.id}.`
+            );
+            return reconciled;
+        }
+        throw new Error(`Participation creation failed for booking ${bookingId}: ${safeErrorMessage(error)}`, { cause: error });
+    }
+
+    if (!isExpectedAcceptedParticipation(created, memberId, bookingId)) {
+        const reconciled = await reconcileAcceptedParticipation(client, memberId, bookingId);
+        if (reconciled) created = reconciled;
+        else throw new Error(`Participation creation returned an unexpected result for booking ${bookingId}.`);
+    }
+
+    const verified = (await getRelevantParticipations(client, memberId, bookingId))
+        .find(participation =>
+            Number(participation.id) === Number(created.id) &&
+            Number(participation.status) === ACCEPTED_PARTICIPATION_STATUS
+        );
+
+    if (!verified) {
+        throw new Error(`Participation ${created.id} was not present as accepted during read-back verification.`);
+    }
+
+    console.log(
+        `[BOOK] Confirmed ${reservation.category} ${dateStr} ${reservation.timeslot}; participation ${verified.id}.`
+    );
+    return verified;
+}
+
+async function findBookingUntilDeadline(client, reservation, dateStr, tagId) {
+    const deadline = Date.now() + SCHEDULE_DISCOVERY_TIMEOUT_MS;
+
+    while (true) {
+        const schedule = await retryRead(
+            () => client.getSchedule({ dateStr, tagId }),
+            `schedule lookup for ${reservation.category} ${reservation.timeslot}`
+        );
+        const candidates = findExactBookingCandidates(unwrapList(schedule), {
+            category: reservation.category,
+            timeslot: reservation.timeslot,
+            dateStr
+        });
+
+        if (candidates.length === 1) return candidates[0];
+        if (candidates.length > 1) {
+            throw new Error(
+                `Found ${candidates.length} exact matches for ${reservation.category} ${dateStr} ${reservation.timeslot}; refusing an ambiguous booking.`
+            );
+        }
+        if (Date.now() >= deadline) {
+            throw new Error(`No exact booking appeared for ${reservation.category} ${dateStr} ${reservation.timeslot}.`);
+        }
+
+        await sleep(750);
     }
 }
 
-function sanitizeLogText(value) {
-    return String(value).replace(/https?:\/\/[^\s"'<>]+/g, rawUrl => sanitizeUrl(rawUrl));
+async function getRelevantParticipations(client, memberId, bookingId) {
+    const response = await retryRead(
+        () => client.getParticipations({ memberId, bookingIds: [bookingId] }),
+        `participation lookup for booking ${bookingId}`
+    );
+
+    return unwrapList(response).filter(participation => {
+        const belongsToBooking = Number(participation?.bookingId ?? participation?.booking?.id) === bookingId;
+        const belongsToMember = Number(participation?.memberId ?? participation?.member?.id) === memberId ||
+            Number(participation?.invitedMemberId ?? participation?.invitedMember?.id) === memberId;
+        return belongsToBooking && belongsToMember;
+    });
 }
 
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+async function reconcileAcceptedParticipation(client, memberId, bookingId) {
+    try {
+        return (await getRelevantParticipations(client, memberId, bookingId))
+            .find(participation => Number(participation.status) === ACCEPTED_PARTICIPATION_STATUS) ?? null;
+    } catch (error) {
+        throw new Error(
+            `Could not reconcile the result of the participation POST for booking ${bookingId}: ${safeErrorMessage(error)}`,
+            { cause: error }
+        );
+    }
+}
+
+function isExpectedAcceptedParticipation(participation, memberId, bookingId) {
+    return Number.isFinite(Number(participation?.id)) &&
+        Number(participation?.bookingId ?? participation?.booking?.id) === bookingId &&
+        Number(participation?.memberId ?? participation?.member?.id) === memberId &&
+        Number(participation?.status) === ACCEPTED_PARTICIPATION_STATUS;
+}
+
+function unwrapEntity(response) {
+    if (response?.data && !Array.isArray(response.data)) return response.data;
+    return response;
+}
+
+function unwrapList(response) {
+    if (Array.isArray(response)) return response;
+    return Array.isArray(response?.data) ? response.data : [];
+}
+
+async function retryRead(operation, label, attempts = 3) {
+    let lastError;
+
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        try {
+            return await operation();
+        } catch (error) {
+            lastError = error;
+            const retryable = error instanceof HttpRequestError &&
+                (error.status === null || error.status === 429 || error.status >= 500);
+            if (!retryable || attempt === attempts) throw error;
+
+            console.warn(`[API] Retrying ${label} after attempt ${attempt}: ${safeErrorMessage(error)}`);
+            await sleep(250 * (2 ** (attempt - 1)));
+        }
+    }
+
+    throw lastError;
+}
+
+function getReservationsForToday(now = new Date()) {
+    const target = getTargetDate(now);
+    return RESERVATIONS.filter(reservation => reservation.dayOfWeek === target.getDay());
+}
+
+function getReservationDateString(now = new Date()) {
+    return formatLocalDate(getTargetDate(now));
+}
+
+function getTargetDate(now) {
+    const target = new Date(now);
+    target.setDate(target.getDate() + DAYS_IN_ADVANCE);
+    return target;
+}
+
+function formatLocalDate(date) {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Europe/Amsterdam',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+    }).formatToParts(date);
+    const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+    return `${values.year}-${values.month}-${values.day}`;
+}
+
+async function waitUntilReservationsOpen(now = new Date()) {
+    const opening = new Date(
+        now.getFullYear(),
+        now.getMonth(),
+        now.getDate(),
+        RESERVATION_OPENS_AT_HOUR,
+        RESERVATION_OPENS_AT_MINUTE,
+        0,
+        0
+    );
+    const delayMs = opening.getTime() - now.getTime();
+
+    if (delayMs > 0) {
+        console.log(`[RUN] Waiting ${Math.ceil(delayMs / 1000)}s for the reservation window.`);
+        await sleep(delayMs);
+    }
+}
+
+function safeErrorMessage(error) {
+    const text = error instanceof Error ? error.message : String(error);
+    return text
+        .replace(/Bearer\s+[^\s]+/gi, 'Bearer [redacted]')
+        .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[JWT redacted]')
+        .slice(0, 1_000);
+}
+
+function sleep(milliseconds) {
+    return new Promise(resolve => setTimeout(resolve, milliseconds));
 }

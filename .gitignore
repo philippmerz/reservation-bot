@@ -2,6 +2,10 @@
 .idea
 node_modules
 .DS_Store
+secrets.json
+
+# Never retain accidental stdin/stdout pseudo-files from credential commands.
+/-
 
 # Logs
 logs

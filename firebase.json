@@ -10,6 +10,8 @@
         ".DS_Store",
         "*.iml",
         "secrets.json",
+        "scripts",
+        "test",
         "firebase-debug.log",
         "firebase-debug.*.log",
         "*.local"
