@@ -31,6 +31,35 @@ const SCHEDULE_DISCOVERY_TIMEOUT_MS = 30_000;
 // Optional "session" pins the exact session type (e.g. "Sauna mixed"), matched on the linked product.
 const RESERVATIONS = loadReservations();
 
+// Confirmed bookings are added to this Google Calendar (set CALENDAR_ID in the git-ignored .env).
+// Share that calendar with the function's service account with "Make changes to events".
+async function addBookingToCalendar(booking, reservation) {
+    const calendarId = process.env.CALENDAR_ID;
+    if (!calendarId || !booking?.id) return;
+    const { GoogleAuth } = require('google-auth-library');
+    const auth = new GoogleAuth({ scopes: ['https://www.googleapis.com/auth/calendar.events'] });
+    const client = await auth.getClient();
+    const title = reservation.session || reservation.category;
+    try {
+        await client.request({
+            url: `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`,
+            method: 'POST',
+            data: {
+                id: `delcom${booking.id}`,
+                summary: title,
+                location: 'Tilburg University Sports Centre',
+                description: 'Booked automatically by reservation-bot.',
+                start: { dateTime: booking.startDate, timeZone: 'Europe/Amsterdam' },
+                end: { dateTime: booking.endDate || booking.startDate, timeZone: 'Europe/Amsterdam' }
+            }
+        });
+        console.log(`[CAL] Added ${title} (booking ${booking.id}) to calendar.`);
+    } catch (error) {
+        if (error?.response?.status === 409) return; // already on the calendar
+        throw error;
+    }
+}
+
 function loadReservations() {
     const fs = require('fs');
     const path = require('path');
@@ -238,7 +267,15 @@ function authRecoveryError(message, cause) {
     );
 }
 
-async function makeApiReservation({ client, memberId, reservation, dateStr, tagId }) {
+async function makeApiReservation(args) {
+    const result = await bookReservation(args);
+    await addBookingToCalendar(result.booking, args.reservation).catch(error =>
+        console.error(`[CAL] Could not add booking ${result.booking?.id} to calendar: ${safeErrorMessage(error)}`)
+    );
+    return result.participation;
+}
+
+async function bookReservation({ client, memberId, reservation, dateStr, tagId }) {
     const booking = await findBookingUntilDeadline(client, reservation, dateStr, tagId);
     const bookingId = Number(booking.id);
 
@@ -252,7 +289,7 @@ async function makeApiReservation({ client, memberId, reservation, dateStr, tagI
             `[BOOK] Already confirmed ${reservation.category} ${dateStr} ${reservation.timeslot}; ` +
             `participation ${accepted.id}.`
         );
-        return accepted;
+        return { booking, participation: accepted };
     }
 
     if (existing.length > 0) {
@@ -277,7 +314,7 @@ async function makeApiReservation({ client, memberId, reservation, dateStr, tagI
                 `[BOOK] Confirmed ${reservation.category} ${dateStr} ${reservation.timeslot} after POST reconciliation; ` +
                 `participation ${reconciled.id}.`
             );
-            return reconciled;
+            return { booking, participation: reconciled };
         }
         throw new Error(`Participation creation failed for booking ${bookingId}: ${safeErrorMessage(error)}`, { cause: error });
     }
@@ -301,7 +338,7 @@ async function makeApiReservation({ client, memberId, reservation, dateStr, tagI
     console.log(
         `[BOOK] Confirmed ${reservation.category} ${dateStr} ${reservation.timeslot}; participation ${verified.id}.`
     );
-    return verified;
+    return { booking, participation: verified };
 }
 
 async function findBookingUntilDeadline(client, reservation, dateStr, tagId) {
