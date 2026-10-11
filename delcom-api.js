@@ -61,15 +61,19 @@ function getAmsterdamDateTime(value) {
     };
 }
 
-function findExactBookingCandidates(bookings, { category, timeslot, dateStr }) {
+function findExactBookingCandidates(bookings, { category, session, timeslot, dateStr }) {
     const normalizedCategory = normalizeLabel(category);
+    const normalizedSession = session ? normalizeLabel(session) : null;
 
     return (Array.isArray(bookings) ? bookings : []).filter(booking => {
         const local = getAmsterdamDateTime(booking?.startDate);
         const categoryMatches = getEntityLabels(booking?.product)
             .some(label => normalizeLabel(label) === normalizedCategory);
 
-        return local.date === dateStr && local.time === timeslot && categoryMatches;
+        const sessionMatches = !normalizedSession || getEntityLabels(booking?.linkedProduct)
+            .some(label => normalizeLabel(label) === normalizedSession);
+
+        return local.date === dateStr && local.time === timeslot && categoryMatches && sessionMatches;
     });
 }
 

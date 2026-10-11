@@ -302,3 +302,16 @@ test('OIDC refresh exposes a known HTTP failure as non-ambiguous', async () => {
         }
     );
 });
+
+test('exact booking match also requires the configured session type', () => {
+    const { findExactBookingCandidates } = require('../delcom-api');
+    const mk = (id, type) => ({
+        id, startDate: '2026-10-18T14:00:00.000Z',
+        product: { description: 'Sauna', translations: [{ language: 'en', description: 'Sauna' }] },
+        linkedProduct: { translations: [{ language: 'en', description: type }] }
+    });
+    const bookings = [mk(1, 'Sauna women'), mk(2, 'Sauna mixed')];
+    const opts = { category: 'Sauna', timeslot: '16:00', dateStr: '2026-10-18' };
+    assert.deepEqual(findExactBookingCandidates(bookings, { ...opts, session: 'Sauna mixed' }).map(b => b.id), [2]);
+    assert.equal(findExactBookingCandidates(bookings, opts).length, 2);
+});

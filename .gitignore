@@ -73,3 +73,6 @@ build/Release
 
 # dataconnect generated files
 .dataconnect
+
+# Real reservation slots (deployed, never committed)
+reservations.json

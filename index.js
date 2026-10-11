@@ -26,12 +26,18 @@ const RESERVATION_OPENS_AT_MINUTE = 0;
 const DAYS_IN_ADVANCE = 7;
 const SCHEDULE_DISCOVERY_TIMEOUT_MS = 30_000;
 
-// dayOfWeek: 0 = Sunday, 1 = Monday, ..., 6 = Saturday.
-const RESERVATIONS = [
-    { category: 'Sauna', timeslot: '21:30', dayOfWeek: 1 },
-    { category: 'Sauna', timeslot: '20:15', dayOfWeek: 3 },
-    { category: 'Sauna', timeslot: '20:15', dayOfWeek: 5 }
-];
+// Slots are configured in reservations.json (git-ignored, deployed with the function).
+// See reservations.example.json for the format. dayOfWeek: 0 = Sunday, ..., 6 = Saturday.
+// Optional "session" pins the exact session type (e.g. "Sauna mixed"), matched on the linked product.
+const RESERVATIONS = loadReservations();
+
+function loadReservations() {
+    const fs = require('fs');
+    const path = require('path');
+    const local = path.join(__dirname, 'reservations.json');
+    const file = fs.existsSync(local) ? local : path.join(__dirname, 'reservations.example.json');
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+}
 
 const secretManager = new SecretManagerServiceClient();
 
@@ -308,6 +314,7 @@ async function findBookingUntilDeadline(client, reservation, dateStr, tagId) {
         );
         const candidates = findExactBookingCandidates(unwrapList(schedule), {
             category: reservation.category,
+            session: reservation.session,
             timeslot: reservation.timeslot,
             dateStr
         });
