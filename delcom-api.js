@@ -335,6 +335,26 @@ function createDelcomClient({
                 })
             }
         }),
+        getBookableSlots: ({ productId, dateStr }) => request('/products/bookable-slots', {
+            query: {
+                s: JSON.stringify({
+                    activityProductIds: { $in: [Number(productId)] },
+                    startDate: { $gte: `${dateStr}T00:00:00` },
+                    endDate: { $lte: `${dateStr}T23:59:59` }
+                })
+            }
+        }),
+        getRecentSales: ({ memberId, limit = 25 }) => request('/sales', {
+            query: {
+                s: JSON.stringify({ customerPersonId: Number(memberId) }),
+                join: 'saleItems',
+                sort: 'id,DESC',
+                limit
+            }
+        }),
+        getSale: saleId => request(`/sales/${Number(saleId)}`, { query: { join: 'saleItems' } }),
+        createCartItem: payload => request('/cart-items', { method: 'POST', body: payload }),
+        createSale: payload => request('/sales', { method: 'POST', body: payload }),
         createParticipation: payload => request('/participations', { method: 'POST', body: payload }),
         deleteParticipation: participationId => request(`/participations/${Number(participationId)}`, {
             method: 'DELETE',

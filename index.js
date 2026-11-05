@@ -12,6 +12,7 @@ const {
     createDelcomClient,
     decodeJwtTemporalClaims,
     findExactBookingCandidates,
+    getAmsterdamDateTime,
     refreshOidcToken,
     resolveCategoryTagId,
     selectUserRole
@@ -110,7 +111,7 @@ exports.yourWeeklyBot = onSchedule({
 
     // Resolve stable names to the portal's current IDs before the booking window opens.
     const tagIds = new Map();
-    for (const category of new Set(reservations.map(reservation => reservation.category))) {
+    for (const category of new Set(reservations.filter(r => !isHall(r)).map(reservation => reservation.category))) {
         tagIds.set(category, await retryRead(
             () => resolveCategoryTagId(client, category),
             `tag lookup for ${category}`
@@ -120,8 +121,14 @@ exports.yourWeeklyBot = onSchedule({
     await waitUntilReservationsOpen();
 
     const failures = [];
-    for (const reservation of reservations) {
+    // Halls first: a free hall hour is scarcer than a sauna seat.
+    const ordered = [...reservations.filter(isHall), ...reservations.filter(r => !isHall(r))];
+    for (const reservation of ordered) {
         try {
+            if (isHall(reservation)) {
+                await makeHallReservation({ client, memberId: Number(member.id), reservation, dateStr });
+                continue;
+            }
             await makeApiReservation({
                 client,
                 memberId: Number(member.id),
@@ -433,6 +440,149 @@ async function retryRead(operation, label, attempts = 3) {
     throw lastError;
 }
 
+// ---------------------------------------------------------------------------
+// Free-hall rentals (e.g. "Vrije sport zaal 4", product 730 on resource 732).
+// Config entry: { "type": "hall", "category": "Hall 4", "productId": 730,
+//   "bookableProductId": 732, "conflictTagId": 189, "timeslot": "15:00", "dayOfWeek": 0 }
+// Flow (mirrors the sporter SPA): GET /products/bookable-slots -> POST /cart-items
+// -> POST /sales (price 0, completes without payment) -> read back the sale.
+// ---------------------------------------------------------------------------
+function isHall(reservation) {
+    return reservation?.type === 'hall';
+}
+
+function hallSaleMatches(sale, reservation, slotStartIso) {
+    return (sale?.saleItems ?? []).some(item => {
+        const productId = Number(item?.productId);
+        const params = typeof item?.params === 'string' ? safeJson(item.params) : item?.params;
+        return productId === Number(reservation.productId) &&
+            params?.startDate && new Date(params.startDate).getTime() === new Date(slotStartIso).getTime();
+    });
+}
+
+function safeJson(text) {
+    try { return JSON.parse(text); } catch { return null; }
+}
+
+async function findExistingHallSale(client, memberId, reservation, slotStartIso) {
+    const response = await retryRead(() => client.getRecentSales({ memberId }), 'recent sales lookup');
+    return unwrapList(response).find(sale => !sale.isCreditOfSaleId && hallSaleMatches(sale, reservation, slotStartIso)) ?? null;
+}
+
+async function findHallSlotUntilDeadline(client, reservation, dateStr) {
+    const deadline = Date.now() + SCHEDULE_DISCOVERY_TIMEOUT_MS;
+    for (;;) {
+        const response = await retryRead(
+            () => client.getBookableSlots({ productId: reservation.productId, dateStr }),
+            `hall slot lookup for ${reservation.category}`
+        );
+        const slot = unwrapList(response).find(candidate => {
+            const local = getAmsterdamDateTime(candidate.startDate);
+            return local.date === dateStr && local.time === reservation.timeslot &&
+                Number(candidate.bookableProductId) === Number(reservation.bookableProductId);
+        });
+        if (slot) return slot;
+        if (Date.now() >= deadline) {
+            throw new Error(`No ${reservation.category} slot at ${dateStr} ${reservation.timeslot} was published.`);
+        }
+        await sleep(2_000);
+    }
+}
+
+// isAvailable alone is not enough: the Rent UI also hides hours covered by
+// scheduled activities (e.g. Kickboxing) in the same hall.
+async function findHallConflict(client, reservation, dateStr, slot) {
+    if (!reservation.conflictTagId) return null;
+    const response = await retryRead(
+        () => client.getSchedule({ dateStr, tagId: reservation.conflictTagId }),
+        `hall conflict lookup for ${reservation.category}`
+    );
+    const start = new Date(slot.startDate).getTime();
+    const end = new Date(slot.endDate).getTime();
+    return unwrapList(response).find(booking => {
+        const bStart = new Date(booking.startDate).getTime();
+        const bEnd = new Date(booking.endDate).getTime();
+        return bStart < end && bEnd > start;
+    }) ?? null;
+}
+
+async function makeHallReservation({ client, memberId, reservation, dateStr }) {
+    const slot = await findHallSlotUntilDeadline(client, reservation, dateStr);
+    const label = `${reservation.category} ${dateStr} ${reservation.timeslot}`;
+
+    const existing = await findExistingHallSale(client, memberId, reservation, slot.startDate);
+    if (existing) {
+        console.log(`[HALL] Already booked ${label}; sale ${existing.id}.`);
+        return existing;
+    }
+    if (!slot.isAvailable) throw new Error(`${label} is not available.`);
+
+    const conflict = await findHallConflict(client, reservation, dateStr, slot);
+    if (conflict) {
+        throw new Error(`${label} overlaps scheduled activity booking ${conflict.id}; not renting.`);
+    }
+
+    const params = {
+        startDate: slot.startDate,
+        endDate: slot.endDate,
+        bookableProductId: Number(slot.bookableProductId),
+        bookableLinkedProductId: Number(slot.linkedProductId ?? reservation.productId),
+        invitedMemberEmails: [],
+        invitedGuests: [],
+        invitedOthers: [],
+        primaryPurchaseMessage: null,
+        secondaryPurchaseMessage: null
+    };
+
+    if (process.env.HALL_DRY_RUN === '1') {
+        console.log(`[HALL] DRY RUN would book ${label}: ${JSON.stringify(params)}`);
+        return null;
+    }
+
+    await client.createCartItem({ type: 'product', productId: Number(reservation.productId), amount: 1, memberId, params });
+
+    let sale;
+    try {
+        sale = unwrapEntity(await client.createSale({
+            siteId: 0,
+            salesPersonId: memberId,
+            customerPersonId: memberId,
+            organizationId: null,
+            orderNumber: null,
+            posId: null,
+            saleItems: [{
+                productId: Number(reservation.productId),
+                subscriptionId: null,
+                courseId: null,
+                quantity: 1,
+                params,
+                bookingId: undefined,
+                customerCategory: null,
+                siteId: 0
+            }]
+        }));
+    } catch (error) {
+        if (!error?.ambiguous) throw error;
+        sale = await findExistingHallSale(client, memberId, reservation, slot.startDate);
+        if (!sale) throw error;
+    }
+
+    const verified = unwrapEntity(await retryRead(() => client.getSale(sale.id), `sale ${sale.id} read-back`));
+    if (Number(verified?.total) !== 0 || Number(verified?.statusCode) !== 0) {
+        throw new Error(
+            `${label}: sale ${sale.id} created but not completed (status ${verified?.statusCode}, total ${verified?.total}). ` +
+            'Check /sales in the sporter portal.'
+        );
+    }
+    console.log(`[HALL] Confirmed ${label}; sale ${sale.id}.`);
+
+    await addBookingToCalendar(
+        { id: `hall${sale.id}`, startDate: slot.startDate, endDate: slot.endDate },
+        { ...reservation, session: reservation.session || 'Vrije sport zaal 4' }
+    ).catch(error => console.error(`[CAL] Could not add hall sale ${sale.id} to calendar: ${safeErrorMessage(error)}`));
+    return verified;
+}
+
 function getReservationsForToday(now = new Date()) {
     const target = getTargetDate(now);
     return RESERVATIONS.filter(reservation => reservation.dayOfWeek === target.getDay());
@@ -488,3 +638,6 @@ function safeErrorMessage(error) {
 function sleep(milliseconds) {
     return new Promise(resolve => setTimeout(resolve, milliseconds));
 }
+
+// Exposed for local dry runs/tests only.
+exports._internal = { makeHallReservation, getReservationsForToday, RESERVATIONS };
