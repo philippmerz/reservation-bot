@@ -76,3 +76,6 @@ build/Release
 
 # Real reservation slots (deployed, never committed)
 reservations.json
+
+# One-off skipped booking dates (deployed, never committed)
+skip-dates.json

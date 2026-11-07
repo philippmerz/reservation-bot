@@ -31,6 +31,9 @@ const SCHEDULE_DISCOVERY_TIMEOUT_MS = 30_000;
 // See reservations.example.json for the format. dayOfWeek: 0 = Sunday, ..., 6 = Saturday.
 // Optional "session" pins the exact session type (e.g. "Sauna mixed"), matched on the linked product.
 const RESERVATIONS = loadReservations();
+// Optional one-off exclusions: skip-dates.json = ["YYYY-MM-DD", ...] (git-ignored, deployed).
+// When the target date (run date + DAYS_IN_ADVANCE) is listed, nothing is booked that day.
+const SKIP_DATES = loadSkipDates();
 
 // Confirmed bookings are added to this Google Calendar (set CALENDAR_ID in the git-ignored .env).
 // Share that calendar with the function's service account with "Make changes to events".
@@ -67,6 +70,16 @@ function loadReservations() {
     const local = path.join(__dirname, 'reservations.json');
     const file = fs.existsSync(local) ? local : path.join(__dirname, 'reservations.example.json');
     return JSON.parse(fs.readFileSync(file, 'utf8'));
+}
+
+function loadSkipDates() {
+    const fs = require('fs');
+    const path = require('path');
+    const file = path.join(__dirname, 'skip-dates.json');
+    if (!fs.existsSync(file)) return [];
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const list = Array.isArray(data) ? data : (data.skipDates || []);
+    return list.map(String);
 }
 
 const secretManager = new SecretManagerServiceClient();
@@ -583,8 +596,13 @@ async function makeHallReservation({ client, memberId, reservation, dateStr }) {
     return verified;
 }
 
-function getReservationsForToday(now = new Date()) {
+function getReservationsForToday(now = new Date(), skipDates = SKIP_DATES) {
     const target = getTargetDate(now);
+    const dateStr = formatLocalDate(target);
+    if (skipDates.includes(dateStr)) {
+        console.log(`[SKIP] ${dateStr} is in skip-dates.json; not booking any reservations for that date.`);
+        return [];
+    }
     return RESERVATIONS.filter(reservation => reservation.dayOfWeek === target.getDay());
 }
 
@@ -640,4 +658,4 @@ function sleep(milliseconds) {
 }
 
 // Exposed for local dry runs/tests only.
-exports._internal = { makeHallReservation, getReservationsForToday, RESERVATIONS };
+exports._internal = { makeHallReservation, getReservationsForToday, getReservationDateString, RESERVATIONS, SKIP_DATES };
