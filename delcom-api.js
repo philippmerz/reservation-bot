@@ -9,8 +9,9 @@ const ACCEPTED_PARTICIPATION_STATUS = 1;
 const VISIBLE_BOOKING_STATUS = 0;
 
 class HttpRequestError extends Error {
-    constructor(message, { method, path, status = null, ambiguous = false, cause = null } = {}) {
+    constructor(message, { method, path, status = null, ambiguous = false, cause = null, responseBody = null } = {}) {
         super(message, cause ? { cause } : undefined);
+        this.responseBody = responseBody;
         this.name = 'HttpRequestError';
         this.method = method;
         this.path = path;
@@ -299,11 +300,16 @@ function createDelcomClient({
         response.requestPath = path;
 
         if (!response.ok) {
-            throw new HttpRequestError(`Delcom ${method} ${path} failed with HTTP ${response.status}.`, {
+            let responseBody = null;
+            try { responseBody = (await response.text()).slice(0, 2_000); } catch { /* ignore */ }
+            throw new HttpRequestError(
+                `Delcom ${method} ${path} failed with HTTP ${response.status}.` +
+                (responseBody ? ` Body: ${responseBody.slice(0, 500)}` : ''), {
                 method,
                 path,
                 status: response.status,
-                ambiguous: false
+                ambiguous: false,
+                responseBody
             });
         }
 
@@ -344,6 +350,19 @@ function createDelcomClient({
                 })
             }
         }),
+        // Raw bookings on given resources (includes other members' rentals, which
+        // /bookings/schedule-bookings omits). Same query the Rent UI uses.
+        getBookings: ({ productIds, startDateMin, endDateMax, limit = 500 }) => request('/bookings', {
+            query: {
+                s: JSON.stringify({
+                    productId: { $in: productIds.map(Number) },
+                    startDate: { $gte: startDateMin },
+                    endDate: { $lte: endDateMax }
+                }),
+                limit
+            }
+        }),
+        getDependantProductLinks: () => request('/products/dependant-product-links'),
         getRecentSales: ({ memberId, limit = 25 }) => request('/sales', {
             query: {
                 s: JSON.stringify({ customerPersonId: Number(memberId) }),

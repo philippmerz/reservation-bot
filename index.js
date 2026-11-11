@@ -478,8 +478,19 @@ function safeJson(text) {
 }
 
 async function findExistingHallSale(client, memberId, reservation, slotStartIso) {
-    const response = await retryRead(() => client.getRecentSales({ memberId }), 'recent sales lookup');
-    return unwrapList(response).find(sale => !sale.isCreditOfSaleId && hallSaleMatches(sale, reservation, slotStartIso)) ?? null;
+    const sales = unwrapList(await retryRead(() => client.getRecentSales({ memberId }), 'recent sales lookup'));
+    // A cancelled rental is credited by a later sale pointing at it; ignore both.
+    const credited = new Set(sales.filter(sale => sale.isCreditOfSaleId).map(sale => Number(sale.isCreditOfSaleId)));
+    return sales.find(sale =>
+        !sale.isCreditOfSaleId && !credited.has(Number(sale.id)) && hallSaleMatches(sale, reservation, slotStartIso)
+    ) ?? null;
+}
+
+// GET /sales/:id is rejected for member roles (401 "misses the required query
+// scopes"), so read the sale back through the member's own sales list.
+async function readBackHallSale(client, memberId, saleId) {
+    const sales = unwrapList(await retryRead(() => client.getRecentSales({ memberId }), `sale ${saleId} read-back`));
+    return sales.find(sale => Number(sale.id) === Number(saleId)) ?? null;
 }
 
 async function findHallSlotUntilDeadline(client, reservation, dateStr) {
@@ -502,21 +513,58 @@ async function findHallSlotUntilDeadline(client, reservation, dateStr) {
     }
 }
 
-// isAvailable alone is not enough: the Rent UI also hides hours covered by
-// scheduled activities (e.g. Kickboxing) in the same hall.
-async function findHallConflict(client, reservation, dateStr, slot) {
-    if (!reservation.conflictTagId) return null;
-    const response = await retryRead(
-        () => client.getSchedule({ dateStr, tagId: reservation.conflictTagId }),
-        `hall conflict lookup for ${reservation.category}`
-    );
+// isAvailable alone is not enough: /products/bookable-slots still reports hours
+// as available that are taken by scheduled activities (e.g. Kickboxing), other
+// members' rentals, or maintenance blocks in the same hall. Mirror the Rent UI:
+// read raw /bookings on the hall resource plus its dependant resources
+// (/products/dependant-product-links) and treat any overlap as a conflict.
+// /bookings/schedule-bookings omits other members' rentals, and hall activities
+// are not tagged with the hall tag (e.g. 189), so neither is enough on its own.
+function findOverlappingHallBookings(bookings, resourceIds, slot) {
+    const ids = new Set(resourceIds.map(Number));
     const start = new Date(slot.startDate).getTime();
     const end = new Date(slot.endDate).getTime();
-    return unwrapList(response).find(booking => {
+    return bookings.filter(booking => {
         const bStart = new Date(booking.startDate).getTime();
         const bEnd = new Date(booking.endDate).getTime();
-        return bStart < end && bEnd > start;
-    }) ?? null;
+        return ids.has(Number(booking.productId)) && bStart < end && bEnd > start;
+    });
+}
+
+async function getHallResourceIds(client, resourceId) {
+    const links = unwrapList(await retryRead(() => client.getDependantProductLinks(), 'dependant product links'));
+    const ids = new Set([Number(resourceId)]);
+    for (const link of links) {
+        if (Number(link.parentId) === Number(resourceId)) ids.add(Number(link.childId));
+    }
+    return [...ids].filter(Number.isFinite);
+}
+
+async function findHallConflict(client, reservation, dateStr, slot) {
+    const resourceId = Number(slot.bookableProductId ?? reservation.bookableProductId);
+    const resourceIds = await getHallResourceIds(client, resourceId);
+    const dayStart = new Date(slot.startDate);
+    const response = await retryRead(
+        () => client.getBookings({
+            productIds: resourceIds,
+            startDateMin: new Date(dayStart.getTime() - 24 * 3_600_000).toISOString(),
+            endDateMax: new Date(dayStart.getTime() + 24 * 3_600_000).toISOString()
+        }),
+        `hall bookings lookup for ${reservation.category}`
+    );
+    if (Number(response?.pageCount) > 1) {
+        throw new Error(`Hall bookings for ${dateStr} are paginated (${response.pageCount} pages); cannot verify ${reservation.category} is free.`);
+    }
+    const bookings = unwrapList(response);
+    if (reservation.conflictTagId) {
+        const tagged = await retryRead(
+            () => client.getSchedule({ dateStr, tagId: reservation.conflictTagId }),
+            `hall tag conflict lookup for ${reservation.category}`
+        );
+        // Tagged activities belong to the hall by tag; match them on time only.
+        for (const booking of unwrapList(tagged)) bookings.push({ ...booking, productId: resourceId });
+    }
+    return findOverlappingHallBookings(bookings, resourceIds, slot)[0] ?? null;
 }
 
 async function makeHallReservation({ client, memberId, reservation, dateStr }) {
@@ -532,7 +580,7 @@ async function makeHallReservation({ client, memberId, reservation, dateStr }) {
 
     const conflict = await findHallConflict(client, reservation, dateStr, slot);
     if (conflict) {
-        throw new Error(`${label} overlaps scheduled activity booking ${conflict.id}; not renting.`);
+        throw new Error(`${label} overlaps booking ${conflict.id} on the hall; not renting.`);
     }
 
     const params = {
@@ -580,8 +628,9 @@ async function makeHallReservation({ client, memberId, reservation, dateStr }) {
         if (!sale) throw error;
     }
 
-    const verified = unwrapEntity(await retryRead(() => client.getSale(sale.id), `sale ${sale.id} read-back`));
-    if (Number(verified?.total) !== 0 || Number(verified?.statusCode) !== 0) {
+    const verified = await readBackHallSale(client, memberId, sale.id);
+    if (!verified || !hallSaleMatches(verified, reservation, slot.startDate) ||
+        Number(verified.total) !== 0 || Number(verified.statusCode) !== 0) {
         throw new Error(
             `${label}: sale ${sale.id} created but not completed (status ${verified?.statusCode}, total ${verified?.total}). ` +
             'Check /sales in the sporter portal.'
@@ -658,4 +707,4 @@ function sleep(milliseconds) {
 }
 
 // Exposed for local dry runs/tests only.
-exports._internal = { makeHallReservation, getReservationsForToday, getReservationDateString, RESERVATIONS, SKIP_DATES };
+exports._internal = { makeHallReservation, readBackHallSale, findExistingHallSale, findOverlappingHallBookings, findHallConflict, getReservationsForToday, getReservationDateString, RESERVATIONS, SKIP_DATES };
