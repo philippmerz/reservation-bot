@@ -62,17 +62,24 @@ function getAmsterdamDateTime(value) {
     };
 }
 
+function entityHasExactLabel(entity, normalizedName) {
+    return getEntityLabels(entity).some(label => normalizeLabel(label) === normalizedName);
+}
+
 function findExactBookingCandidates(bookings, { category, session, timeslot, dateStr }) {
     const normalizedCategory = normalizeLabel(category);
     const normalizedSession = session ? normalizeLabel(session) : null;
 
     return (Array.isArray(bookings) ? bookings : []).filter(booking => {
         const local = getAmsterdamDateTime(booking?.startDate);
-        const categoryMatches = getEntityLabels(booking?.product)
-            .some(label => normalizeLabel(label) === normalizedCategory);
+        // Group classes use linkedProduct as the activity (e.g. Flexibility) and
+        // product as the venue (e.g. Danszaal). Sauna uses product as the
+        // category name. Accept an exact label on either so both keep matching.
+        const categoryMatches = entityHasExactLabel(booking?.linkedProduct, normalizedCategory)
+            || entityHasExactLabel(booking?.product, normalizedCategory);
 
-        const sessionMatches = !normalizedSession || getEntityLabels(booking?.linkedProduct)
-            .some(label => normalizeLabel(label) === normalizedSession);
+        const sessionMatches = !normalizedSession
+            || entityHasExactLabel(booking?.linkedProduct, normalizedSession);
 
         return local.date === dateStr && local.time === timeslot && categoryMatches && sessionMatches;
     });

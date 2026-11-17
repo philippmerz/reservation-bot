@@ -315,3 +315,97 @@ test('exact booking match also requires the configured session type', () => {
     assert.deepEqual(findExactBookingCandidates(bookings, { ...opts, session: 'Sauna mixed' }).map(b => b.id), [2]);
     assert.equal(findExactBookingCandidates(bookings, opts).length, 2);
 });
+
+test('Flexibility matches the activity name, not the venue, and Sauna men still matches', () => {
+    // Shape taken from the live 24 Nov 2026 schedule-bookings payload.
+    const bookings = [
+        {
+            id: 698877,
+            startDate: '2026-11-24T17:00:00.000Z',
+            product: {
+                description: 'nieuw Danszaal',
+                translations: [
+                    { language: 'en', description: 'Dance hall' },
+                    { language: 'nl', description: 'Danszaal' }
+                ]
+            },
+            linkedProduct: {
+                description: 'Flexibility',
+                translations: [
+                    { language: 'en', description: 'Flexibility' },
+                    { language: 'nl', description: 'Flexibility' }
+                ]
+            }
+        },
+        {
+            id: 695308,
+            startDate: '2026-11-24T20:00:00.000Z',
+            product: {
+                description: 'nieuw Sporthal 3',
+                translations: [
+                    { language: 'en', description: 'Sports hall 3 ' },
+                    { language: 'nl', description: 'Sporthal 3 ' }
+                ]
+            },
+            linkedProduct: {
+                description: 'Flexibility',
+                translations: [
+                    { language: 'en', description: 'Flexibility' },
+                    { language: 'nl', description: 'Flexibility' }
+                ]
+            }
+        },
+        {
+            id: 704959,
+            startDate: '2026-11-24T20:00:00.000Z',
+            product: {
+                description: 'nieuw Staff sports extra',
+                translations: [
+                    { language: 'en', description: 'Staff sports extra' },
+                    { language: 'nl', description: 'Staff sports extra' }
+                ]
+            },
+            linkedProduct: {
+                description: 'Staff flexibility',
+                translations: [
+                    { language: 'en', description: 'Staff and students flexibility' },
+                    { language: 'nl', description: 'Flexibility personeel en studenten' }
+                ]
+            }
+        },
+        {
+            id: 674250,
+            startDate: '2026-11-24T18:00:00.000Z',
+            product: {
+                description: 'nieuw Sauna resource',
+                translations: [
+                    { language: 'en', description: 'Sauna ' },
+                    { language: 'nl', description: 'Sauna' }
+                ]
+            },
+            linkedProduct: {
+                description: 'Sauna men activiteit',
+                translations: [
+                    { language: 'en', description: 'Sauna men' },
+                    { language: 'nl', description: 'Sauna mannen' }
+                ]
+            }
+        }
+    ];
+
+    const flexibility = findExactBookingCandidates(bookings, {
+        category: 'Flexibility',
+        session: 'Flexibility',
+        timeslot: '18:00',
+        dateStr: '2026-11-24'
+    });
+    assert.deepEqual(flexibility.map(booking => booking.id), [698877]);
+
+    const saunaMen = findExactBookingCandidates(bookings, {
+        category: 'Sauna',
+        session: 'Sauna men',
+        timeslot: '19:00',
+        dateStr: '2026-11-24'
+    });
+    assert.deepEqual(saunaMen.map(booking => booking.id), [674250]);
+});
