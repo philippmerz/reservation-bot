@@ -5,9 +5,16 @@ slots through Delcom's HTTP API. Chromium is not part of the scheduled runtime.
 
 ## Runtime flow
 
-- Runs daily at 07:59 in `Europe/Amsterdam` and books seven days ahead.
-- Refreshes the SURF/OpenConext session once, then stores and verifies the
-  rotated refresh token before making any booking request.
+- `yourWeeklyBot` runs daily at 07:59 in `Europe/Amsterdam` and books classes
+  and sauna sessions seven days ahead. The portal publishes those as a full day
+  at 08:00.
+- Hall rentals (`yourWeeklyHallBot`) open on a rolling 7-day clock: the Sunday
+  15:00 Hall 4 hour is not in `/products/bookable-slots` at 08:00, only from
+  15:00 that same day. That function runs at 14:59 and waits until 15:00, then
+  books Hall 4 seven days ahead. Class and sauna timing is unchanged.
+- Each run refreshes the SURF/OpenConext session once, then stores and verifies
+  the rotated refresh token before making any booking request. A hall run that
+  has no hall reservation for the target date returns before touching the token.
 - Resolves the category tag dynamically, matches exactly on local date/time and
   product name, checks for an existing participation, creates at most once, and
   verifies the accepted participation with a read-back request.
@@ -49,5 +56,5 @@ The deployed runtime service account needs these two secret-level roles on
 Deploy with:
 
 ```bash
-firebase deploy --only functions:yourWeeklyBot --project reservation-bot-8e993
+firebase deploy --only functions:yourWeeklyBot,functions:yourWeeklyHallBot --project reservation-bot-8e993
 ```

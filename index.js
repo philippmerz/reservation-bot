@@ -86,25 +86,42 @@ const secretManager = new SecretManagerServiceClient();
 
 setGlobalOptions({ maxInstances: 1, concurrency: 1 });
 
-exports.yourWeeklyBot = onSchedule({
-    schedule: '59 7 * * *',
+const SCHEDULER_OPTIONS = {
     timeZone: 'Europe/Amsterdam',
     memory: '256MiB',
     timeoutSeconds: 180,
     // The upstream refresh token is single-use. An ambiguous refresh response
     // must never cause Cloud Scheduler to submit the stored token a second time.
     retryCount: 0
+};
+
+// Classes and sauna: the portal publishes the whole target day at 08:00, 7 days ahead.
+exports.yourWeeklyBot = onSchedule({
+    schedule: '59 7 * * *',
+    ...SCHEDULER_OPTIONS
 }, async () => {
-    const now = new Date();
+    await runScheduledReservations({ kind: 'class', now: new Date() });
+});
+
+// Hall rentals publish on a rolling 7-day clock (the 15:00 hour opens at 15:00,
+// not at 08:00). Book them in a later Sunday run without changing class timing.
+exports.yourWeeklyHallBot = onSchedule({
+    schedule: '59 14 * * *',
+    ...SCHEDULER_OPTIONS
+}, async () => {
+    await runScheduledReservations({ kind: 'hall', now: new Date() });
+});
+
+async function runScheduledReservations({ kind, now }) {
     const dateStr = getReservationDateString(now);
-    const reservations = getReservationsForToday(now);
+    const reservations = filterReservationsForRun(getReservationsForToday(now), kind);
 
     if (reservations.length === 0) {
-        console.log(`[RUN] No configured reservations for ${dateStr}.`);
+        console.log(`[RUN] No configured ${kind} reservations for ${dateStr}.`);
         return;
     }
 
-    console.log(`[RUN] Preparing ${reservations.length} reservation(s) for ${dateStr}.`);
+    console.log(`[RUN] Preparing ${reservations.length} ${kind} reservation(s) for ${dateStr}.`);
 
     const session = await getRefreshedSession();
     const unaffiliatedClient = createLoggedDelcomClient({ accessToken: session.accessToken });
@@ -131,7 +148,8 @@ exports.yourWeeklyBot = onSchedule({
         ));
     }
 
-    await waitUntilReservationsOpen();
+    if (kind === 'hall') await waitUntilEarliestTimeslot(reservations, now);
+    else await waitUntilReservationsOpen(now);
 
     const failures = [];
     // Halls first: a free hall hour is scarcer than a sauna seat.
@@ -160,7 +178,19 @@ exports.yourWeeklyBot = onSchedule({
     }
 
     console.log('[RUN] All configured reservations are confirmed.');
-});
+}
+
+function filterReservationsForRun(reservations, kind) {
+    if (kind === 'hall') return reservations.filter(isHall);
+    if (kind === 'class') return reservations.filter(reservation => !isHall(reservation));
+    return reservations;
+}
+
+function parseTimeslot(timeslot) {
+    const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(String(timeslot ?? ''));
+    if (!match) throw new Error(`Invalid timeslot ${timeslot}.`);
+    return { hour: Number(match[1]), minute: Number(match[2]) };
+}
 
 function createLoggedDelcomClient(options) {
     return createDelcomClient({
@@ -493,6 +523,14 @@ async function readBackHallSale(client, memberId, saleId) {
     return sales.find(sale => Number(sale.id) === Number(saleId)) ?? null;
 }
 
+function selectHallSlot(slots, reservation, dateStr) {
+    return (Array.isArray(slots) ? slots : []).find(candidate => {
+        const local = getAmsterdamDateTime(candidate.startDate);
+        return local.date === dateStr && local.time === reservation.timeslot &&
+            Number(candidate.bookableProductId) === Number(reservation.bookableProductId);
+    }) ?? null;
+}
+
 async function findHallSlotUntilDeadline(client, reservation, dateStr) {
     const deadline = Date.now() + SCHEDULE_DISCOVERY_TIMEOUT_MS;
     for (;;) {
@@ -500,11 +538,7 @@ async function findHallSlotUntilDeadline(client, reservation, dateStr) {
             () => client.getBookableSlots({ productId: reservation.productId, dateStr }),
             `hall slot lookup for ${reservation.category}`
         );
-        const slot = unwrapList(response).find(candidate => {
-            const local = getAmsterdamDateTime(candidate.startDate);
-            return local.date === dateStr && local.time === reservation.timeslot &&
-                Number(candidate.bookableProductId) === Number(reservation.bookableProductId);
-        });
+        const slot = selectHallSlot(unwrapList(response), reservation, dateStr);
         if (slot) return slot;
         if (Date.now() >= deadline) {
             throw new Error(`No ${reservation.category} slot at ${dateStr} ${reservation.timeslot} was published.`);
@@ -676,22 +710,36 @@ function formatLocalDate(date) {
     return `${values.year}-${values.month}-${values.day}`;
 }
 
-async function waitUntilReservationsOpen(now = new Date()) {
+function delayUntilLocalTimeMs(now, hour, minute) {
     const opening = new Date(
         now.getFullYear(),
         now.getMonth(),
         now.getDate(),
-        RESERVATION_OPENS_AT_HOUR,
-        RESERVATION_OPENS_AT_MINUTE,
+        hour,
+        minute,
         0,
         0
     );
-    const delayMs = opening.getTime() - now.getTime();
+    return Math.max(0, opening.getTime() - now.getTime());
+}
 
+async function waitUntilLocalTime(hour, minute, now = new Date()) {
+    const delayMs = delayUntilLocalTimeMs(now, hour, minute);
     if (delayMs > 0) {
-        console.log(`[RUN] Waiting ${Math.ceil(delayMs / 1000)}s for the reservation window.`);
+        console.log(`[RUN] Waiting ${Math.ceil(delayMs / 1000)}s for ${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}.`);
         await sleep(delayMs);
     }
+}
+
+async function waitUntilReservationsOpen(now = new Date()) {
+    await waitUntilLocalTime(RESERVATION_OPENS_AT_HOUR, RESERVATION_OPENS_AT_MINUTE, now);
+}
+
+async function waitUntilEarliestTimeslot(reservations, now = new Date()) {
+    const times = reservations.map(reservation => parseTimeslot(reservation.timeslot));
+    if (times.length === 0) return;
+    times.sort((first, second) => first.hour - second.hour || first.minute - second.minute);
+    await waitUntilLocalTime(times[0].hour, times[0].minute, now);
 }
 
 function safeErrorMessage(error) {
@@ -707,4 +755,18 @@ function sleep(milliseconds) {
 }
 
 // Exposed for local dry runs/tests only.
-exports._internal = { makeHallReservation, readBackHallSale, findExistingHallSale, findOverlappingHallBookings, findHallConflict, getReservationsForToday, getReservationDateString, RESERVATIONS, SKIP_DATES };
+exports._internal = {
+    makeHallReservation,
+    readBackHallSale,
+    findExistingHallSale,
+    findOverlappingHallBookings,
+    findHallConflict,
+    selectHallSlot,
+    filterReservationsForRun,
+    delayUntilLocalTimeMs,
+    parseTimeslot,
+    getReservationsForToday,
+    getReservationDateString,
+    RESERVATIONS,
+    SKIP_DATES
+};
